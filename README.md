@@ -1,6 +1,6 @@
 # WinOptimizer
 
-Optimizador de rendimiento para Windows 10 y Windows 11. Monitorea CPU, RAM y disco en tiempo real, libera memoria, limpia archivos temporales y gestiona el inicio del sistema.
+Optimizador de rendimiento para Windows 10 y Windows 11. Monitorea CPU, RAM física, memoria virtual, caché del sistema, disco, red y procesos activos — todo en tiempo real, sin instalar nada.
 
 > Desarrollado por **Enmanuel Gil** — Sin instalación, gratuito, código abierto.
 
@@ -10,23 +10,42 @@ Optimizador de rendimiento para Windows 10 y Windows 11. Monitorea CPU, RAM y di
 
 | Vista principal |
 |---|
-| Secciones compactas: Memoria, CPU, Disco y Registro de acciones |
+| Secciones: RAM física, RAM virtual, Caché, CPU, Disco, Red, Historial, Top procesos |
+| Icono en la bandeja del sistema con menú contextual |
+| Historial gráfico de 2 minutos (CPU y RAM) |
 | Barra de estado con métricas en tiempo real |
-| Botones de acción rápida en la parte inferior |
 
 ---
 
 ## Características
 
-- **Monitoreo en tiempo real** — CPU, RAM y disco actualizados cada 2 segundos sin bloquear la interfaz
-- **Liberar RAM** — Reduce el Working Set de procesos activos y fuerza recolección de basura
+### Monitoreo en tiempo real (cada 2 segundos)
+- **Memoria física** — En uso %, libre GB, total GB + barra de progreso
+- **Memoria virtual (paginada)** — Committed bytes vs. commit limit
+- **Caché del sistema** — Bytes residentes en RAM (System Cache)
+- **Procesador CPU** — Porcentaje de uso + modelo detectado automáticamente
+- **Almacenamiento C:** — Libre, usado y total + barra de progreso
+- **Red** — Velocidad de descarga y subida del adaptador activo
+
+### Análisis de procesos
+- **Top 5 procesos por RAM** — Nombre, MB en uso y PID, actualizado en vivo
+
+### Historial gráfico
+- **Sparklines 2 minutos** — Gráfico visual de CPU (azul) y RAM (rojo) con 60 muestras
+
+### Bandeja del sistema
+- **Minimizar a la bandeja** — La ventana se oculta al cerrar o al usar el menú
+- **Menú contextual** — Abrir, Optimizar, Liberar RAM, Salir
+- **Tooltip** — CPU%, RAM% y espacio libre sin abrir la ventana
+
+### Acciones de optimización
+- **Liberar RAM** — Reduce Working Set de procesos activos + GC forzado
 - **Limpiar temporales** — Elimina archivos de `%TEMP%` y `C:\Windows\Temp`
-- **Optimización rápida** — Ejecuta liberación de RAM + limpieza de temporales con un clic
-- **Inicio de Windows** — Abre el Administrador de tareas en la pestaña Inicio (Win 10/11)
+- **Optimización rápida** — Libera RAM + limpia temporales con un clic
+- **Inicio de Windows** — Abre el Administrador de tareas en pestaña Inicio
 - **Plan de energía** — Acceso directo a Opciones de energía del sistema
 - **Siempre visible** — Opción para mantener la ventana sobre otras aplicaciones
 - **Actualización manual** — Tecla `F5` o menú Ver → Actualizar
-- **Menú completo** — Archivo / Ver / Herramientas / Ayuda con todas las funciones
 
 ---
 
@@ -72,34 +91,65 @@ Sin permisos de administrador: todas las funciones de usuario funcionan normalme
 
 ---
 
+## Comparación con herramientas similares
+
+| Función | WinOptimizer | Mem Reduct |
+|---|:---:|:---:|
+| Memoria física | ✅ | ✅ |
+| Memoria virtual | ✅ | ✅ |
+| Caché del sistema | ✅ | ✅ |
+| Bandeja del sistema | ✅ | ✅ |
+| CPU en tiempo real | ✅ | ❌ |
+| Disco en tiempo real | ✅ | ❌ |
+| Velocidad de red | ✅ | ❌ |
+| Top procesos por RAM | ✅ | ❌ |
+| Historial gráfico | ✅ | ❌ |
+| Limpiar temporales | ✅ | ❌ |
+| Gestión de inicio | ✅ | ❌ |
+| Sin instalación | ✅ | ❌ |
+| Código abierto | ✅ | ❌ |
+
+---
+
 ## Arquitectura técnica
 
 ```
 WinOptimizer.ps1
 ├── Background Worker (Runspace independiente)
-│   ├── Get-CimInstance → CPU model, RAM total (una sola vez)
-│   └── Get-Counter cada 2s → CPU%, RAM libre, Disco
-│       \Procesador(_Total)\% de tiempo de procesador
-│       \Memoria\Mbytes disponibles
-│       Get-PSDrive C → libre/usado
+│   ├── CimInstance (una vez): modelo CPU, RAM total
+│   ├── Get-Counter cada 2s: CPU%, RAM libre
+│   │     \Procesador(_Total)\% de tiempo de procesador
+│   │     \Memoria\Mbytes disponibles
+│   ├── CimInstance PerfOS_Memory: Memoria virtual + Caché
+│   │     CommittedBytes, CommitLimit, SystemCacheResidentBytes
+│   ├── CimInstance Tcpip_NetworkInterface: Velocidad de red
+│   │     BytesReceivedPersec, BytesSentPersec
+│   ├── Get-PSDrive C: espacio en disco
+│   ├── Get-Process: Top 5 por WorkingSet64
+│   └── Historial (List[int] local → array compartido)
 ├── DispatcherTimer (hilo UI) cada 2s
-│   └── Lee hashtable compartido → actualiza TextBlocks, ProgressBars
-├── Funciones de acción (hilo UI)
-│   ├── Free-RAM    → GC.Collect + MinWorkingSet/MaxWorkingSet
-│   ├── Clean-Temp  → Remove-Item en %TEMP% y Windows\Temp
-│   └── Quick-Optimize → Free-RAM + Clean-Temp
+│   ├── Lee hashtable compartido (thread-safe, microsegundos)
+│   ├── Actualiza: TextBlocks, ProgressBars, Labels
+│   ├── Dibuja sparklines (WPF Canvas + Polyline)
+│   └── Actualiza tooltip de la bandeja
+├── System.Windows.Forms.NotifyIcon
+│   ├── Minimize-to-tray al cerrar ventana
+│   └── ContextMenuStrip: Abrir / Optimizar / Liberar RAM / Salir
 └── WPF XAML
     ├── Menu (Archivo, Ver, Herramientas, Ayuda)
-    ├── GroupBox × 4 (RAM, CPU, Disco, Registro)
-    ├── ProgressBar × 3 (sin ControlTemplate custom)
+    ├── ScrollViewer con 9 GroupBox
+    │   RAM física, RAM virtual, Caché, CPU, Disco, Red,
+    │   Historial gráfico, Top procesos, Registro
+    ├── ProgressBar × 5 (sin ControlTemplate custom)
     └── StatusBar con métricas en tiempo real
 ```
 
 **Decisiones de diseño:**
-- Sin `Add-Type -TypeDefinition` → no hay compilación C# al arrancar
-- Sin `ControlTemplate` inline → XamlReader.Load() es instantáneo
+- Sin `Add-Type -TypeDefinition` → sin compilación C# al arrancar (0ms vs 10-30s)
+- Sin `ControlTemplate` inline → `XamlReader.Load()` instantáneo
 - `[hashtable]::Synchronized()` para comunicación cross-thread segura
 - Performance Counters en español (Windows en ES: `\Procesador` en lugar de `\Processor`)
+- `NotifyIcon` cargado como assembly, sin Add-Type (sin compilación)
 
 ---
 
@@ -134,18 +184,24 @@ WinOptimizer/
 
 ## Changelog
 
+### v2.1.0
+- **Memoria virtual** — Sección dedicada con CommittedBytes vs CommitLimit
+- **Caché del sistema** — SystemCacheResidentBytes en tiempo real
+- **Red** — Velocidad de descarga y subida del adaptador activo
+- **Top 5 procesos** — Por RAM física, con PID y MB en uso
+- **Historial gráfico** — Sparklines de 2 minutos para CPU y RAM
+- **Bandeja del sistema** — Minimize-to-tray, menú contextual, tooltip
+- Interfaz reestructurada con ScrollViewer para alojar todas las secciones
+
 ### v2.0.0
 - Interfaz rediseñada: compacta, funcional, inspirada en herramientas de sistema clásicas
 - Background Runspace para lecturas de contador sin bloquear la UI
 - Menú completo (Archivo, Ver, Herramientas, Ayuda)
-- Acceso directo a Inicio de Windows y Plan de energía
-- Barra de progreso visual para RAM, CPU y disco
-- Barra de estado persistente con métricas en tiempo real
 - Compilación a .exe con ícono propio
 
 ### v1.0.0
 - Versión inicial con 5 paneles (Dashboard, RAM, Temp, Startup, Power)
-- Performance Counters en lugar de WMI para lecturas rápidas
+- Performance Counters para lecturas en tiempo real
 
 ---
 
