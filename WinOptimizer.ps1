@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    WinOptimizer v2.3.0
+    WinOptimizer v2.3.1
     Optimizador de rendimiento para Windows 10/11
     Enmanuel Gil - github.com/EnMaNueL-G
 #>
@@ -844,7 +844,7 @@ On $miAlwaysTop Unchecked { $window.Topmost=$false }
 On $miPowerPlan Click { try{Start-Process "powercfg.cpl"}catch{} }
 On $miGithub    Click { try{Start-Process "https://github.com/EnMaNueL-G/WinOptimizer"}catch{} }
 On $miAbout     Click {
-    $msg="WinOptimizer v2.3.0`r`n"
+    $msg="WinOptimizer v2.3.1`r`n"
     $msg+="Optimizador para Windows 10/11`r`n`r`n"
     $msg+="  RAM fisica, virtual, cache, CPU, Disco, Red`r`n"
     $msg+="  Top 5 procesos con Kill`r`n"
@@ -883,16 +883,19 @@ $script:timer.Add_Tick({Update-UI})
 if ($graphCanvas) { $graphCanvas.Add_SizeChanged({try{Update-Graph}catch{}}) }
 
 $window.Add_Loaded({
-    try{Init-Tray}catch{}
-    Start-Worker
-    $script:timer.Start()
-    SafeLog "WinOptimizer v2.3.0 iniciado"
+    try { Init-Tray } catch {}
+    try { Start-Worker } catch { SafeLog "Worker error: $_" }
+    try { $script:timer.Start() } catch {}
+    SafeLog "WinOptimizer v2.3.1 iniciado"
     SafeStatus "Cargando datos del sistema..."
-    # Cargar startup con un breve delay para no bloquear el Loaded
-    $stTimer=[System.Windows.Threading.DispatcherTimer]::new()
-    $stTimer.Interval=[TimeSpan]::FromSeconds(1)
-    $stTimer.Add_Tick({ try{Refresh-StartupUI}catch{}; $stTimer.Stop() })
-    $stTimer.Start()
+    # $script:stTimer — scope de script para que el Tick closure lo encuentre
+    $script:stTimer = [System.Windows.Threading.DispatcherTimer]::new()
+    $script:stTimer.Interval = [TimeSpan]::FromSeconds(1)
+    $script:stTimer.Add_Tick({
+        try { Refresh-StartupUI } catch {}
+        try { if ($script:stTimer) { $script:stTimer.Stop() } } catch {}
+    })
+    try { $script:stTimer.Start() } catch {}
 })
 $window.Add_Closing({
     if (-not $script:forceClose) {

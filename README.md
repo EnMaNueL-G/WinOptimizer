@@ -154,6 +154,10 @@ WinOptimizer/
 
 ## Changelog
 
+### v2.3.1
+- Correccion de error NULL al iniciar: `$stTimer` movido a scope de script para que el Tick closure lo encuentre correctamente tras retornar el handler `Loaded`
+- Todos los bloques del handler `Loaded` envueltos en `try/catch` independientes
+
 ### v2.3.0
 - **Inicio de Windows integrado** — lista, analiza y permite activar/desactivar entradas de inicio directamente en la GUI (sin abrir el Administrador de tareas)
 - **Recomendaciones automaticas** por categoria para cada entrada de inicio
