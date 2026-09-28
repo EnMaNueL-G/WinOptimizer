@@ -31,6 +31,15 @@ Monitorea el sistema en tiempo real, gestiona el inicio de Windows, libera memor
   - `Desconocido` — entrada no clasificada
 - **Activar / Desactivar** con un clic (usa la clave `StartupApproved` del registro, igual que el Administrador de tareas de Windows)
 
+### Salud de discos
+- Estado de cada disco (SSD / disco duro): **Buena**, **Atención** o **Mal estado**
+- Con administrador: temperatura, horas encendido, desgaste y errores de lectura (contadores de fiabilidad de Windows + SMART)
+- Avisa si un disco anuncia un fallo próximo, está muy caliente, muy desgastado o tiene muchas horas de uso
+
+### Información del equipo
+- Placa base, BIOS, procesador, RAM (módulos, velocidad y ranuras libres), gráficos y driver, versión de Windows, fecha de instalación, tiempo encendido y batería (salud real en portátiles)
+- **Copiar informe**: copia todo el equipo + discos + uso actual al portapapeles, listo para pegar en un chat de soporte
+
 ### Procesos activos
 - **Top 5 por RAM** — nombre, MB en uso, PID
 - **Botón Kill** con confirmación para terminar cualquier proceso de la lista
@@ -47,7 +56,7 @@ Monitorea el sistema en tiempo real, gestiona el inicio de Windows, libera memor
 - **Optimizar sistema** — libera Working Set + limpia temporales + GC forzado
 - **Liberar RAM** — reduce Working Set de procesos activos
 - **Limpiar temporales** — elimina archivos de `%TEMP%` y `C:\Windows\Temp`
-- **Auto-optimización** — programada cada 5, 15 o 30 minutos desde el menú
+- **Auto-optimización** — programada cada 15 o 30 minutos desde el menú (vaciar la memoria muy a menudo puede ralentizar el PC; se recomienda 30 min)
 - **Plan de energía** — acceso directo a Opciones de energía
 
 ---
@@ -84,7 +93,7 @@ Monitorea el sistema en tiempo real, gestiona el inicio de Windows, libera memor
 
 **Sin administrador:** todas las funciones de monitoreo, historial, top procesos, liberar RAM y limpiar temporales del usuario funcionan normalmente.
 
-**Con administrador:** acceso completo para modificar entradas de inicio del sistema (HKLM), terminar procesos protegidos y limpiar `C:\Windows\Temp`.
+**Con administrador:** acceso completo para modificar entradas de inicio del sistema (HKLM), terminar procesos protegidos, limpiar `C:\Windows\Temp` y ver temperatura, horas de uso y desgaste de los discos.
 
 ---
 
@@ -155,6 +164,12 @@ WinOptimizer/
 ---
 
 ## Changelog
+
+### v2.4.0
+- **Salud de discos**: estado de cada SSD / disco duro con avisos (fallo SMART, temperatura, desgaste, horas de uso, errores de lectura)
+- **Información del equipo**: placa, BIOS, CPU, RAM (módulos y ranuras), gráficos y driver, Windows, batería
+- **Copiar informe** del equipo al portapapeles (botón y menú Herramientas)
+- Auto-optimización: eliminado el intervalo de 5 min (vaciar la memoria tan a menudo puede ralentizar); 30 min recomendado
 
 ### v2.3.2
 Revision completa, probada en Windows 11 real:

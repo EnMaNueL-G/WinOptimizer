@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    WinOptimizer v2.3.2
+    WinOptimizer v2.4.0
     Optimizador de rendimiento para Windows 10/11
     Enmanuel Gil - github.com/EnMaNueL-G
 #>
@@ -29,7 +29,108 @@ $script:d = [hashtable]::Synchronized(@{
     TopProcMBs=[int[]]@(0,0,0,0,0)
     TopProcPIDs=[int[]]@(0,0,0,0,0)
     CpuHistory=[int[]]@(); RamHistory=[int[]]@(); Tick=0
+    # Equipo y salud de discos (v2.4.0): se rellenan en segundo plano
+    InfoVer=0; HwLabels=[string[]]@(); HwValues=[string[]]@()
+    DiskNames=[string[]]@(); DiskDetails=[string[]]@(); DiskStatus=[string[]]@(); DiskLevels=[int[]]@(); DiskNote=''
 })
+
+# ============================================================
+#  EQUIPO + SALUD DE DISCOS (hilo aparte: no congela la ventana)
+# ============================================================
+function Start-InfoWorker {
+    try { if ($script:infoPS) { $script:infoPS.Dispose() }; if ($script:infoRS) { $script:infoRS.Close() } } catch {}
+    $rs = [RunspaceFactory]::CreateRunspace(); $rs.Open()
+    $rs.SessionStateProxy.SetVariable('d', $script:d)
+    $ps = [PowerShell]::Create(); $ps.Runspace = $rs
+    $null = $ps.AddScript({
+        $L = New-Object System.Collections.Generic.List[string]; $V = New-Object System.Collections.Generic.List[string]
+        # (ojo: PowerShell no distingue mayusculas; los parametros no pueden llamarse $l/$v como las listas)
+        function Add-Hw($etiqueta, $valor) { if ($valor -and "$valor".Trim()) { $L.Add($etiqueta); $V.Add(("$valor" -replace '\s+', ' ').Trim()) } }
+        function Fmt-Date($x) { try { if ($x) { return ([datetime]$x).ToString('dd/MM/yyyy') } } catch {}; return '' }
+        # Textos de relleno que ponen los fabricantes en PCs montados por piezas: no aportan nada
+        $relleno = 'System Product Name|System manufacturer|To Be Filled|Default string|O\.E\.M\.|Not Applicable|^\s*$'
+        try { $cs = Get-CimInstance Win32_ComputerSystem -EA Stop
+              if ("$($cs.Model)" -notmatch $relleno) { Add-Hw 'Equipo' "$($cs.Manufacturer) $($cs.Model)" } } catch {}
+        try { $b = Get-CimInstance Win32_BaseBoard -EA Stop; Add-Hw 'Placa base' "$($b.Manufacturer) $($b.Product)" } catch {}
+        try { $bi = Get-CimInstance Win32_BIOS -EA Stop; Add-Hw 'BIOS' ("$($bi.SMBIOSBIOSVersion)" + $(if ($bi.ReleaseDate) { " (" + (Fmt-Date $bi.ReleaseDate) + ")" } else { '' })) } catch {}
+        try { $c = Get-CimInstance Win32_Processor -EA Stop | Select-Object -First 1
+              Add-Hw 'Procesador' "$($c.Name) - $($c.NumberOfCores) nucleos / $($c.NumberOfLogicalProcessors) hilos" } catch {}
+        try {
+            $m = @(Get-CimInstance Win32_PhysicalMemory -EA Stop)
+            $slots = (Get-CimInstance Win32_PhysicalMemoryArray -EA SilentlyContinue | Measure-Object MemoryDevices -Sum).Sum
+            $tot = [int](($m | Measure-Object Capacity -Sum).Sum / 1GB)
+            $mods = ($m | Group-Object { "$([int]($_.Capacity/1GB)) GB $($_.ConfiguredClockSpeed) MHz" } | ForEach-Object { "$($_.Count) x $($_.Name)" }) -join ' + '
+            Add-Hw 'RAM' ("$tot GB ($mods)" + $(if ($slots) { " - ranuras usadas $($m.Count) de $slots" } else { '' }))
+        } catch {}
+        try { Get-CimInstance Win32_VideoController -EA Stop | ForEach-Object {
+                Add-Hw 'Graficos' ("$($_.Name)" + $(if ($_.DriverVersion) { " - driver $($_.DriverVersion)" + $(if ($_.DriverDate) { " (" + (Fmt-Date $_.DriverDate) + ")" } else { '' }) } else { '' })) } } catch {}
+        try {
+            $os = Get-CimInstance Win32_OperatingSystem -EA Stop
+            $dv = ''; try { $dv = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -EA Stop).DisplayVersion } catch {}
+            Add-Hw 'Windows' ("$($os.Caption) $dv (compilacion $($os.BuildNumber))" -replace 'Microsoft ', '')
+            Add-Hw 'Instalado' (Fmt-Date $os.InstallDate)
+            $up = (Get-Date) - $os.LastBootUpTime
+            Add-Hw 'Encendido' ("hace " + $(if ($up.Days -gt 0) { "$($up.Days) d " } else { '' }) + "$($up.Hours) h $($up.Minutes) min")
+        } catch {}
+        try {
+            $bat = Get-CimInstance Win32_Battery -EA Stop | Select-Object -First 1
+            if ($bat) {
+                $txt = "$($bat.EstimatedChargeRemaining)% de carga"
+                try {  # desgaste real (capacidad actual vs de fabrica); puede requerir administrador
+                    $des = (Get-CimInstance -Namespace root/wmi -ClassName BatteryStaticData -EA Stop | Select-Object -First 1).DesignedCapacity
+                    $ful = (Get-CimInstance -Namespace root/wmi -ClassName BatteryFullChargedCapacity -EA Stop | Select-Object -First 1).FullChargedCapacity
+                    if ($des -gt 0 -and $ful -gt 0) { $txt += " - salud $([int]($ful * 100 / $des))% de la capacidad original" }
+                } catch {}
+                Add-Hw 'Bateria' $txt
+            }
+        } catch {}
+
+        # --- Salud de discos ---
+        $dn = New-Object System.Collections.Generic.List[string]; $dd = New-Object System.Collections.Generic.List[string]
+        $ds = New-Object System.Collections.Generic.List[string]; $dl = New-Object System.Collections.Generic.List[int]
+        $note = ''; $noRel = $false
+        try {
+            $predict = $false
+            try { $predict = [bool](@(Get-CimInstance -Namespace root/wmi -ClassName MSStorageDriver_FailurePredictStatus -EA Stop) | Where-Object { $_.PredictFailure }) } catch {}
+            foreach ($pd in @(Get-PhysicalDisk -EA Stop | Sort-Object { [int]$_.DeviceId })) {
+                $lvl = 0; $why = New-Object System.Collections.Generic.List[string]
+                $media = switch ("$($pd.MediaType)") { 'SSD' { 'SSD' } 'HDD' { 'Disco duro' } default { 'Disco' } }
+                $det = "$media $($pd.BusType) - $([int]($pd.Size / 1GB)) GB"
+                $rc = $null; try { $rc = $pd | Get-StorageReliabilityCounter -EA Stop } catch {}
+                if ($rc) {
+                    if ($rc.Temperature -gt 0) {
+                        $det += " - $($rc.Temperature) C"
+                        $hot = if ($media -eq 'SSD') { 70 } else { 55 }
+                        if ($rc.Temperature -ge $hot) { $lvl = [Math]::Max($lvl, 1); $why.Add('temperatura alta') }
+                    }
+                    if ($rc.PowerOnHours -gt 0) {
+                        $det += " - $('{0:N0}' -f $rc.PowerOnHours) h encendido"
+                        if ($media -eq 'Disco duro' -and $rc.PowerOnHours -ge 40000) { $lvl = [Math]::Max($lvl, 1); $why.Add('muchas horas de uso: ten respaldo') }
+                    }
+                    if ($rc.Wear -gt 0) {
+                        $det += " - desgaste $($rc.Wear)%"
+                        if ($rc.Wear -ge 95) { $lvl = 2; $why.Add('desgaste casi total') } elseif ($rc.Wear -ge 80) { $lvl = [Math]::Max($lvl, 1); $why.Add('desgaste alto') }
+                    }
+                    if ($rc.ReadErrorsUncorrected -gt 0) { $lvl = 2; $why.Add("$($rc.ReadErrorsUncorrected) errores de lectura sin corregir") }
+                } else { $noRel = $true }
+                switch ("$($pd.HealthStatus)") { 'Warning' { $lvl = [Math]::Max($lvl, 1); $why.Add('Windows avisa de un problema') } 'Unhealthy' { $lvl = 2; $why.Add('Windows lo marca en mal estado') } }
+                $st = switch ($lvl) { 0 { 'Buena' } 1 { 'Atencion' } default { 'Mal estado' } }
+                if ($why.Count) { $det += "`n" + ($why -join '; ') }
+                $dn.Add("$($pd.FriendlyName)"); $dd.Add($det); $ds.Add($st); $dl.Add($lvl)
+            }
+            if ($predict) { $note = 'ATENCION: un disco anuncia un fallo proximo (SMART). Haz una copia de seguridad YA.' }
+            elseif ($noRel) { $note = 'Ejecuta como administrador para ver temperatura, horas de uso y desgaste.' }
+            else { $note = 'Datos de Windows (SMART y contadores de fiabilidad).' }
+        } catch { $note = 'No se pudo leer el estado de los discos en este equipo.' }
+
+        $d['HwLabels'] = [string[]]$L.ToArray(); $d['HwValues'] = [string[]]$V.ToArray()
+        $d['DiskNames'] = [string[]]$dn.ToArray(); $d['DiskDetails'] = [string[]]$dd.ToArray()
+        $d['DiskStatus'] = [string[]]$ds.ToArray(); $d['DiskLevels'] = [int[]]$dl.ToArray(); $d['DiskNote'] = $note
+        $d['InfoVer'] = [int]$d['InfoVer'] + 1
+    })
+    $null = $ps.BeginInvoke()
+    $script:infoPS = $ps; $script:infoRS = $rs
+}
 
 # ============================================================
 #  BACKGROUND WORKER
@@ -153,9 +254,11 @@ function Start-Worker {
         <MenuItem x:Name="miPowerPlan" Header="Plan de energia..."/>
         <Separator/>
         <MenuItem x:Name="miAutoOff"   Header="Auto-opt: Desactivada"     IsCheckable="True" IsChecked="True"/>
-        <MenuItem x:Name="miAuto5"     Header="Auto-opt: Cada 5 minutos"  IsCheckable="True"/>
         <MenuItem x:Name="miAuto15"    Header="Auto-opt: Cada 15 minutos" IsCheckable="True"/>
-        <MenuItem x:Name="miAuto30"    Header="Auto-opt: Cada 30 minutos" IsCheckable="True"/>
+        <MenuItem x:Name="miAuto30"    Header="Auto-opt: Cada 30 minutos (recomendado)" IsCheckable="True"/>
+        <MenuItem x:Name="miAutoInfo"  Header="(vaciar la memoria muy seguido puede ralentizar el PC)" IsEnabled="False"/>
+        <Separator/>
+        <MenuItem x:Name="miReport"    Header="Copiar informe del equipo"/>
       </MenuItem>
       <MenuItem Header="Ayuda">
         <MenuItem x:Name="miAbout"  Header="Acerca de WinOptimizer"/>
@@ -262,6 +365,22 @@ function Start-Worker {
           </Grid>
         </GroupBox>
 
+        <!-- SALUD DE DISCOS (v2.4.0) -->
+        <GroupBox Margin="0,0,0,4" Padding="6,3,6,6" BorderBrush="#AAAACC" Background="White">
+          <GroupBox.Header>
+            <StackPanel Orientation="Horizontal">
+              <TextBlock Text="Salud de discos" FontWeight="SemiBold" Foreground="#003399" FontSize="11" VerticalAlignment="Center"/>
+              <Button x:Name="btnRefreshDisks" Content="Actualizar" Margin="8,0,0,0"
+                      Padding="6,1" FontSize="10" Background="#E8E8E8"
+                      BorderBrush="#BBBBBB" BorderThickness="1" Cursor="Hand"/>
+            </StackPanel>
+          </GroupBox.Header>
+          <StackPanel>
+            <StackPanel x:Name="diskList"/>
+            <TextBlock x:Name="lblDiskHealthInfo" Text="Analizando discos..." FontSize="10" Foreground="#888" Margin="0,3,0,0" TextWrapping="Wrap"/>
+          </StackPanel>
+        </GroupBox>
+
         <!-- RED -->
         <GroupBox Margin="0,0,0,4" Padding="6,3,6,6" BorderBrush="#AAAACC" Background="White">
           <GroupBox.Header><TextBlock Text="Red" FontWeight="SemiBold" Foreground="#003399" FontSize="11"/></GroupBox.Header>
@@ -272,6 +391,21 @@ function Start-Worker {
             <TextBlock Grid.Row="1" Grid.Column="0" Text="Enviando"   VerticalAlignment="Center" Foreground="#555"/>
             <TextBlock x:Name="lblNetRx" Grid.Row="0" Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center" FontWeight="Bold" Foreground="#0078D4" Text="--"/>
             <TextBlock x:Name="lblNetTx" Grid.Row="1" Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center" Foreground="#555" Text="--"/>
+          </Grid>
+        </GroupBox>
+
+        <!-- EQUIPO / HARDWARE (v2.4.0) -->
+        <GroupBox Margin="0,0,0,4" Padding="6,3,6,6" BorderBrush="#AAAACC" Background="White">
+          <GroupBox.Header>
+            <StackPanel Orientation="Horizontal">
+              <TextBlock Text="Equipo" FontWeight="SemiBold" Foreground="#003399" FontSize="11" VerticalAlignment="Center"/>
+              <Button x:Name="btnCopyReport" Content="Copiar informe" Margin="8,0,0,0"
+                      Padding="6,1" FontSize="10" Background="#E8E8E8"
+                      BorderBrush="#BBBBBB" BorderThickness="1" Cursor="Hand"/>
+            </StackPanel>
+          </GroupBox.Header>
+          <Grid x:Name="hwGrid">
+            <Grid.ColumnDefinitions><ColumnDefinition Width="78"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
           </Grid>
         </GroupBox>
 
@@ -407,10 +541,13 @@ $miRefresh        = Get-C "miRefresh";      $miOptimize     = Get-C "miOptimize"
 $miFreeRam        = Get-C "miFreeRam";      $miCleanTemp    = Get-C "miCleanTemp"
 $miPowerPlan      = Get-C "miPowerPlan";    $miAbout        = Get-C "miAbout"
 $miGithub         = Get-C "miGithub";       $miMinTray      = Get-C "miMinTray"
-$miAutoOff        = Get-C "miAutoOff";      $miAuto5        = Get-C "miAuto5"
+$miAutoOff        = Get-C "miAutoOff"
 $miAuto15         = Get-C "miAuto15";       $miAuto30       = Get-C "miAuto30"
 $startupList      = Get-C "startupList";    $btnRefreshStartup = Get-C "btnRefreshStartup"
 $lblStartupInfo   = Get-C "lblStartupInfo"
+$diskList         = Get-C "diskList";       $lblDiskHealthInfo = Get-C "lblDiskHealthInfo"
+$btnRefreshDisks  = Get-C "btnRefreshDisks"; $hwGrid        = Get-C "hwGrid"
+$btnCopyReport    = Get-C "btnCopyReport";  $miReport       = Get-C "miReport"
 
 # ============================================================
 #  UTILIDADES
@@ -666,6 +803,74 @@ function Refresh-StartupUI {
 }
 
 # ============================================================
+#  EQUIPO + SALUD DE DISCOS — PINTAR / INFORME
+# ============================================================
+$script:infoShown = 0
+function New-Brush($hex) { [System.Windows.Media.SolidColorBrush]([System.Windows.Media.ColorConverter]::ConvertFromString($hex)) }
+function Render-Info {
+    try {
+        if ($diskList) {
+            $diskList.Children.Clear()
+            $names = $script:d['DiskNames']; $dets = $script:d['DiskDetails']; $sts = $script:d['DiskStatus']; $lvs = $script:d['DiskLevels']
+            for ($i = 0; $i -lt $names.Length; $i++) {
+                $row = New-Object System.Windows.Controls.Border
+                $row.BorderThickness = [System.Windows.Thickness]::new(0,0,0,1); $row.BorderBrush = New-Brush '#EEEEEE'
+                $row.Padding = [System.Windows.Thickness]::new(2,3,2,3)
+                $g = New-Object System.Windows.Controls.Grid
+                $c1 = New-Object System.Windows.Controls.ColumnDefinition; $c1.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+                $c2 = New-Object System.Windows.Controls.ColumnDefinition; $c2.Width = [System.Windows.GridLength]::new(70)
+                $g.ColumnDefinitions.Add($c1); $g.ColumnDefinitions.Add($c2)
+                $sp = New-Object System.Windows.Controls.StackPanel
+                $t1 = New-Object System.Windows.Controls.TextBlock; $t1.Text = $names[$i]; $t1.FontWeight = [System.Windows.FontWeights]::SemiBold; $t1.FontSize = 11
+                $t1.TextTrimming = [System.Windows.TextTrimming]::CharacterEllipsis
+                $t2 = New-Object System.Windows.Controls.TextBlock; $t2.Text = $dets[$i]; $t2.FontSize = 9.5; $t2.Foreground = New-Brush '#777777'
+                $t2.TextWrapping = [System.Windows.TextWrapping]::Wrap
+                $sp.Children.Add($t1) | Out-Null; $sp.Children.Add($t2) | Out-Null
+                [System.Windows.Controls.Grid]::SetColumn($sp, 0); $g.Children.Add($sp) | Out-Null
+                $t3 = New-Object System.Windows.Controls.TextBlock; $t3.Text = $sts[$i]; $t3.FontWeight = [System.Windows.FontWeights]::Bold; $t3.FontSize = 11
+                $t3.Foreground = New-Brush $(switch ($lvs[$i]) { 0 { '#1E8E3E' } 1 { '#E67E22' } default { '#CC2200' } })
+                $t3.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Right; $t3.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+                [System.Windows.Controls.Grid]::SetColumn($t3, 1); $g.Children.Add($t3) | Out-Null
+                $row.Child = $g; $diskList.Children.Add($row) | Out-Null
+            }
+            SafeText $lblDiskHealthInfo $script:d['DiskNote']
+            if ($script:d['DiskNote'] -like 'ATENCION*') { try { $lblDiskHealthInfo.Foreground = New-Brush '#CC2200'; $lblDiskHealthInfo.FontWeight = [System.Windows.FontWeights]::Bold } catch {} }
+        }
+        if ($hwGrid) {
+            $hwGrid.Children.Clear(); $hwGrid.RowDefinitions.Clear()
+            $ls = $script:d['HwLabels']; $vs = $script:d['HwValues']
+            for ($i = 0; $i -lt $ls.Length; $i++) {
+                $rd = New-Object System.Windows.Controls.RowDefinition; $rd.Height = [System.Windows.GridLength]::Auto; $hwGrid.RowDefinitions.Add($rd)
+                $a = New-Object System.Windows.Controls.TextBlock; $a.Text = $ls[$i]; $a.Foreground = New-Brush '#555555'; $a.Margin = [System.Windows.Thickness]::new(0,1,4,1)
+                $b = New-Object System.Windows.Controls.TextBlock; $b.Text = $vs[$i]; $b.TextWrapping = [System.Windows.TextWrapping]::Wrap; $b.Margin = [System.Windows.Thickness]::new(0,1,0,1)
+                [System.Windows.Controls.Grid]::SetRow($a, $i); [System.Windows.Controls.Grid]::SetRow($b, $i); [System.Windows.Controls.Grid]::SetColumn($b, 1)
+                $hwGrid.Children.Add($a) | Out-Null; $hwGrid.Children.Add($b) | Out-Null
+            }
+        }
+    } catch { SafeLog "Error al mostrar la informacion del equipo" }
+}
+# Texto con todo el equipo + estado actual: para pegar en un chat, correo o ticket de soporte
+function Copy-Report {
+    try {
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.AppendLine("INFORME DEL EQUIPO - WinOptimizer v2.4.0 - " + (Get-Date).ToString('dd/MM/yyyy HH:mm'))
+        [void]$sb.AppendLine("Nombre del equipo: $env:COMPUTERNAME")
+        $ls = $script:d['HwLabels']; $vs = $script:d['HwValues']
+        for ($i = 0; $i -lt $ls.Length; $i++) { [void]$sb.AppendLine(("{0,-11}: {1}" -f $ls[$i], $vs[$i])) }
+        [void]$sb.AppendLine(''); [void]$sb.AppendLine('DISCOS')
+        $names = $script:d['DiskNames']
+        for ($i = 0; $i -lt $names.Length; $i++) {
+            [void]$sb.AppendLine("- $($names[$i]): $($script:d['DiskStatus'][$i]) | " + ($script:d['DiskDetails'][$i] -replace "`n", ' | '))
+        }
+        $tm = $script:d['TotalMB']; $fm = $script:d['FreeMB']
+        [void]$sb.AppendLine(''); [void]$sb.AppendLine('AHORA')
+        [void]$sb.AppendLine("CPU $($script:d['CpuPct'])% | RAM $(if ($tm -gt 0) { [int](($tm - $fm) * 100 / $tm) } else { 0 })% en uso de $(FmtMB $tm) | C: $(Fmt $script:d['DiskFree']) libres de $(Fmt $script:d['DiskTotal'])")
+        [System.Windows.Clipboard]::SetText($sb.ToString())
+        SafeLog "Informe del equipo copiado al portapapeles"; SafeStatus "Informe copiado: pegalo con Ctrl+V"
+    } catch { SafeStatus "No se pudo copiar el informe" }
+}
+
+# ============================================================
 #  GRAFICO
 # ============================================================
 function Update-Graph {
@@ -736,6 +941,7 @@ function Update-UI {
         }
     } catch {}
     Update-Graph
+    if ([int]$script:d['InfoVer'] -ne $script:infoShown) { $script:infoShown = [int]$script:d['InfoVer']; Render-Info }
     try {
         $c=$script:d['CpuPct']; $t=$script:d['TotalMB']; $f=$script:d['FreeMB']
         $r=if($t -gt 0){[int](($t-$f)*100/$t)}else{0}
@@ -833,13 +1039,12 @@ function Kill-Proc($pid2,$name) {
 #  AUTO-OPTIMIZACION
 # ============================================================
 $script:autoTimer=$null
-$script:autoItems=@($miAutoOff,$miAuto5,$miAuto15,$miAuto30)
+$script:autoItems=@($miAutoOff,$miAuto15,$miAuto30)
 function Set-AutoOptimize($min) {
     if ($script:autoTimer) { try{$script:autoTimer.Stop()}catch{}; $script:autoTimer=$null }
     foreach ($mi in $script:autoItems) { try{if($mi){$mi.IsChecked=$false}}catch{} }
     switch($min) {
         0  { try{if($miAutoOff){$miAutoOff.IsChecked=$true}}catch{}; SafeLog "Auto-opt desactivada" }
-        5  { try{if($miAuto5) {$miAuto5.IsChecked =$true}}catch{} }
         15 { try{if($miAuto15){$miAuto15.IsChecked =$true}}catch{} }
         30 { try{if($miAuto30){$miAuto30.IsChecked =$true}}catch{} }
     }
@@ -894,7 +1099,9 @@ On $btnOptimize      Click { Quick-Optimize }; On $btnFreeRam   Click { Free-RAM
 On $miOptimize       Click { Quick-Optimize }; On $miFreeRam    Click { Free-RAM    }
 On $miCleanTemp      Click { Clean-Temp     }; On $miRefresh    Click { Update-UI   }
 On $btnRefreshStartup Click { Refresh-StartupUI }
-On $miAutoOff  Click { Set-AutoOptimize 0  }; On $miAuto5  Click { Set-AutoOptimize 5  }
+On $miAutoOff  Click { Set-AutoOptimize 0  }
+On $btnRefreshDisks Click { SafeText $lblDiskHealthInfo "Analizando discos..."; Start-InfoWorker }
+On $btnCopyReport   Click { Copy-Report }; On $miReport Click { Copy-Report }
 On $miAuto15   Click { Set-AutoOptimize 15 }; On $miAuto30 Click { Set-AutoOptimize 30 }
 On $miMinTray  Click {
     $window.Hide()
@@ -905,11 +1112,13 @@ On $miAlwaysTop Unchecked { $window.Topmost=$false }
 On $miPowerPlan Click { try{Start-Process "powercfg.cpl"}catch{} }
 On $miGithub    Click { try{Start-Process "https://github.com/EnMaNueL-G/WinOptimizer"}catch{} }
 On $miAbout     Click {
-    $msg="WinOptimizer v2.3.2`r`n"
+    $msg="WinOptimizer v2.4.0`r`n"
     $msg+="Optimizador para Windows 10/11`r`n`r`n"
     $msg+="  RAM fisica, virtual, cache, CPU, Disco, Red`r`n"
     $msg+="  Top 5 procesos con Kill`r`n"
     $msg+="  Inicio de Windows integrado (activar/desactivar)`r`n"
+    $msg+="  Salud de discos (SMART) e informacion del equipo`r`n"
+    $msg+="  Copiar informe del equipo para soporte`r`n"
     $msg+="  Historial grafico 2 min, Bandeja, Auto-opt`r`n`r`n"
     $msg+="Desarrollado por Enmanuel Gil`r`n"
     $msg+="github.com/EnMaNueL-G - MIT License"
@@ -946,8 +1155,9 @@ if ($graphCanvas) { $graphCanvas.Add_SizeChanged({try{Update-Graph}catch{}}) }
 $window.Add_Loaded({
     try { Init-Tray } catch {}
     try { Start-Worker } catch { SafeLog "Worker error: $_" }
+    try { Start-InfoWorker } catch { SafeLog "Info error: $_" }
     try { $script:timer.Start() } catch {}
-    SafeLog "WinOptimizer v2.3.2 iniciado"
+    SafeLog "WinOptimizer v2.4.0 iniciado"
     SafeStatus "Cargando datos del sistema..."
     # $script:stTimer — scope de script para que el Tick closure lo encuentre
     $script:stTimer = [System.Windows.Threading.DispatcherTimer]::new()

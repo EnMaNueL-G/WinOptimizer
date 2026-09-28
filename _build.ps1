@@ -1,8 +1,8 @@
-# _build.ps1 — Genera icon.ico y compila WinOptimizer.exe
+﻿# _build.ps1 â€” Genera icon.ico y compila WinOptimizer.exe
 # Ejecutar desde la carpeta del proyecto (Desktop\OptiSuite\Proyectos\WinOptimizer)
 Set-Location $PSScriptRoot
 
-# ── 1. Crear icon.ico ─────────────────────────────────────────────────────
+# â”€â”€ 1. Crear icon.ico â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 Write-Host "[1/3] Creando icon.ico..." -ForegroundColor Cyan
 Add-Type -AssemblyName System.Drawing
 
@@ -81,7 +81,7 @@ function New-IcoFile {
 
 New-IcoFile -OutPath "icon.ico" -Size 48
 
-# ── 2. Instalar PS2EXE si no esta disponible ─────────────────────────────
+# â”€â”€ 2. Instalar PS2EXE si no esta disponible â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 Write-Host "[2/3] Verificando PS2EXE..." -ForegroundColor Cyan
 
 if (-not (Get-Module -ListAvailable -Name ps2exe)) {
@@ -98,7 +98,7 @@ if (-not (Get-Module -ListAvailable -Name ps2exe)) {
     Write-Host "   ps2exe ya disponible" -ForegroundColor Green
 }
 
-# ── 3. Compilar WinOptimizer.exe ─────────────────────────────────────────
+# â”€â”€ 3. Compilar WinOptimizer.exe â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 Write-Host "[3/3] Compilando WinOptimizer.exe..." -ForegroundColor Cyan
 
 Import-Module ps2exe -ErrorAction Stop
@@ -112,7 +112,7 @@ $buildParams = @{
     Description = "Optimizador de rendimiento para Windows 10/11"
     Company     = "Enmanuel Gil"
     Copyright   = "(c) 2026 Enmanuel Gil"
-    Version     = "2.3.2.0"
+    Version     = "2.4.0.0"
     NoOutput    = $false
 }
 
