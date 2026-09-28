@@ -93,10 +93,12 @@ Monitorea el sistema en tiempo real, gestiona el inicio de Windows, libera memor
 ```
 WinOptimizer.ps1
 ├── Background Worker (Runspace independiente — nunca bloquea la UI)
-│   ├── Get-Counter cada 2s: CPU %, RAM libre
-│   ├── CIM Win32_PerfFormattedData_PerfOS_Memory: virtual + cache
-│   ├── CIM MSAcpi_ThermalZoneTemperature: temperatura CPU
-│   ├── CIM Win32_PerfFormattedData_Tcpip_NetworkInterface: red
+│   ├── Una muestra cada 2s (funciona en Windows de cualquier idioma)
+│   ├── CIM Win32_Processor.LoadPercentage: CPU %
+│   ├── CIM Win32_OperatingSystem: RAM libre + memoria virtual (commit)
+│   ├── CIM Win32_PerfFormattedData_PerfOS_Memory: cache
+│   ├── CIM MSAcpi_ThermalZoneTemperature: temperatura (si el equipo la ofrece)
+│   ├── .NET NetworkInterface: velocidad de red por diferencia de bytes
 │   ├── Get-PSDrive C: espacio en disco
 │   ├── Get-Process: Top 5 por WorkingSet64
 │   │     Almacenados como string[]/int[] paralelos (thread-safe)
@@ -107,8 +109,8 @@ WinOptimizer.ps1
 │   └── Actualiza controles + sparklines (Canvas + Polyline)
 │
 ├── Gestor de Inicio de Windows
-│   ├── Lee HKCU/HKLM\...\Run para listar entradas
-│   ├── Lee StartupApproved para estado activo/inactivo
+│   ├── Lee HKCU/HKLM\...\Run, WOW6432Node\...\Run y las carpetas "Inicio"
+│   ├── Lee StartupApproved (Run, Run32, StartupFolder) para estado activo/inactivo
 │   ├── Escribe StartupApproved para activar/desactivar
 │   ├── Motor de recomendaciones por nombre de entrada
 │   └── UI dinámica: controles WPF creados en código (sin templates XAML)
@@ -153,6 +155,17 @@ WinOptimizer/
 ---
 
 ## Changelog
+
+### v2.3.2
+Revision completa, probada en Windows 11 real:
+- **Gestor de Inicio de Windows**: ahora funciona (no se podia mostrar la lista: siempre salia "Error al leer entradas de inicio"). Incluye tambien los programas de 32 bits y las carpetas "Inicio", como el Administrador de tareas, y lee bien el estado activo/inactivo
+- **Procesos (top 5) y boton Kill**: ahora se muestran (la lista salia vacia)
+- **Barras de CPU, cache y disco y temperatura**: ahora se actualizan (se quedaban a 0 / "--")
+- **Red**: muestra la velocidad real (antes siempre 0 B/s)
+- **Windows en cualquier idioma**: CPU y RAM ya no dependen de contadores en espanol (en Windows en ingles salia CPU 0% y RAM 100%)
+- **Liberar RAM**: el contador de procesos ya es correcto (siempre decia 0) y mide lo liberado de verdad
+- **Limpiar temporales**: solo borra archivos de mas de 24 h (no rompe instaladores en marcha) y solo cuenta lo que realmente se borro
+- Datos visibles desde los primeros segundos y historial de exactamente 2 min
 
 ### v2.3.1
 - Correccion de error NULL al iniciar: `$stTimer` movido a scope de script para que el Tick closure lo encuentre correctamente tras retornar el handler `Loaded`

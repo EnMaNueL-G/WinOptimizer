@@ -1,5 +1,5 @@
 # _build.ps1 — Genera icon.ico y compila WinOptimizer.exe
-# Ejecutar desde: C:\Users\usuario\Desktop\SER\WinOptimizer\
+# Ejecutar desde la carpeta del proyecto (Desktop\OptiSuite\Proyectos\WinOptimizer)
 Set-Location $PSScriptRoot
 
 # ── 1. Crear icon.ico ─────────────────────────────────────────────────────
@@ -112,7 +112,7 @@ $buildParams = @{
     Description = "Optimizador de rendimiento para Windows 10/11"
     Company     = "Enmanuel Gil"
     Copyright   = "(c) 2026 Enmanuel Gil"
-    Version     = "2.0.0.0"
+    Version     = "2.3.2.0"
     NoOutput    = $false
 }
 

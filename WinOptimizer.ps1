@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    WinOptimizer v2.3.1
+    WinOptimizer v2.3.2
     Optimizador de rendimiento para Windows 10/11
     Enmanuel Gil - github.com/EnMaNueL-G
 #>
@@ -48,29 +48,52 @@ function Start-Worker {
         } catch {}
         $cpuH = New-Object System.Collections.Generic.List[int]
         $ramH = New-Object System.Collections.Generic.List[int]
+        # Temperatura: solo si el equipo la ofrece (muchas placas no; ademas pide administrador)
+        $tempOk = $true
+        # Red: bytes acumulados por adaptador en la vuelta anterior (la velocidad se calcula por diferencia)
+        $netPrev = @{}; $netT = [DateTime]::UtcNow
         while ($true) {
+            $loopT = [System.Diagnostics.Stopwatch]::StartNew()
+            # CPU y RAM con WMI: funciona en Windows de CUALQUIER idioma
+            # (antes: contadores con nombre en espanol -> en Windows en ingles CPU 0% y RAM 100%)
             try {
-                $d['CpuPct'] = [int]((Get-Counter '\Procesador(_Total)\% de tiempo de procesador' -EA Stop).CounterSamples[0].CookedValue)
-                $d['FreeMB'] = [long]((Get-Counter '\Memoria\Mbytes disponibles' -EA Stop).CounterSamples[0].CookedValue)
+                $cpus = @(Get-CimInstance Win32_Processor -Property LoadPercentage -EA Stop)
+                $d['CpuPct'] = [int](($cpus | Measure-Object LoadPercentage -Average).Average)
             } catch {}
             try {
-                $pm = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory -EA Stop
-                $d['VirtUsedMB']  = [long]($pm.CommittedBytes / 1MB)
-                $d['VirtTotalMB'] = [long]($pm.CommitLimit    / 1MB)
-                $d['VirtFreeMB']  = [long](($pm.CommitLimit - $pm.CommittedBytes) / 1MB)
-                $d['VirtPct']     = if ($pm.CommitLimit -gt 0) { [int](($pm.CommittedBytes/$pm.CommitLimit)*100) } else { 0 }
-                $d['CacheMB']     = [long]($pm.SystemCacheResidentBytes / 1MB)
+                $os = Get-CimInstance Win32_OperatingSystem -Property FreePhysicalMemory,TotalVirtualMemorySize,FreeVirtualMemory -EA Stop
+                $d['FreeMB']      = [long]($os.FreePhysicalMemory / 1KB)
+                $d['VirtTotalMB'] = [long]($os.TotalVirtualMemorySize / 1KB)
+                $d['VirtFreeMB']  = [long]($os.FreeVirtualMemory / 1KB)
+                $d['VirtUsedMB']  = $d['VirtTotalMB'] - $d['VirtFreeMB']
+                $d['VirtPct']     = if ($d['VirtTotalMB'] -gt 0) { [int]($d['VirtUsedMB'] * 100 / $d['VirtTotalMB']) } else { 0 }
             } catch {}
             try {
-                $t = Get-CimInstance -Namespace 'root/WMI' -ClassName MSAcpi_ThermalZoneTemperature -EA Stop | Select-Object -First 1
-                $d['CpuTempC'] = if ($t) { [int](($t.CurrentTemperature - 2732) / 10) } else { -1 }
-            } catch { $d['CpuTempC'] = -1 }
+                $pm = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory -Property SystemCacheResidentBytes -EA Stop
+                $d['CacheMB'] = [long]($pm.SystemCacheResidentBytes / 1MB)
+            } catch {}
+            if ($tempOk) {
+                try {
+                    $t = Get-CimInstance -Namespace 'root/WMI' -ClassName MSAcpi_ThermalZoneTemperature -EA Stop | Select-Object -First 1
+                    $d['CpuTempC'] = if ($t) { [int](($t.CurrentTemperature - 2732) / 10) } else { -1 }
+                } catch { $d['CpuTempC'] = -1; $tempOk = $false }
+            }
             try { $dr = Get-PSDrive C -EA Stop; $d['DiskFree']=$dr.Free; $d['DiskTotal']=$dr.Free+$dr.Used } catch {}
             try {
-                $nic = Get-CimInstance Win32_PerfFormattedData_Tcpip_NetworkInterface -EA Stop |
-                    Where-Object { $_.Name -notlike '*Loopback*' -and $_.Name -notlike '*Virtual*' } |
-                    Sort-Object BytesTotalPersec -Descending | Select-Object -First 1
-                if ($nic) { $d['NetRxBps']=[long]$nic.BytesReceivedPersec; $d['NetTxBps']=[long]$nic.BytesSentPersec }
+                # Velocidad real de red (antes siempre 0 B/s: esos contadores de WMI consultados una vez dan 0)
+                $now = [DateTime]::UtcNow; $secs = ($now - $netT).TotalSeconds; $netT = $now
+                $best = $null; $bestSum = -1L
+                foreach ($ni in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+                    if ($ni.OperationalStatus -ne 'Up') { continue }
+                    if ($ni.NetworkInterfaceType -in 'Loopback','Tunnel') { continue }
+                    $st = $ni.GetIPv4Statistics(); $rx = [long]$st.BytesReceived; $tx = [long]$st.BytesSent
+                    $p = $netPrev[$ni.Id]; $netPrev[$ni.Id] = @($rx, $tx)
+                    if ($p -and $secs -gt 0) {
+                        $drx = [Math]::Max(0L, $rx - $p[0]); $dtx = [Math]::Max(0L, $tx - $p[1])
+                        if (($drx + $dtx) -gt $bestSum) { $bestSum = $drx + $dtx; $best = @([long]($drx / $secs), [long]($dtx / $secs)) }
+                    }
+                }
+                if ($best) { $d['NetRxBps'] = $best[0]; $d['NetTxBps'] = $best[1] }
             } catch {}
             try {
                 $skip = @('System','smss','csrss','wininit','winlogon','lsass','services',
@@ -91,7 +114,8 @@ function Start-Worker {
                 $d['CpuHistory']=[int[]]$cpuH.ToArray(); $d['RamHistory']=[int[]]$ramH.ToArray()
             } catch {}
             $d['Tick']++
-            Start-Sleep -Seconds 2
+            # una muestra cada 2 s en total (las consultas ya tardan ~1,5 s): el historial cubre 2 min de verdad
+            Start-Sleep -Milliseconds ([Math]::Max(200, 2000 - [int]$loopT.ElapsedMilliseconds))
         }
     })
     $null = $ps.BeginInvoke()
@@ -369,10 +393,12 @@ $lblDiskFree  = Get-C "lblDiskFree";  $lblDiskUsed  = Get-C "lblDiskUsed"
 $lblDiskTotal = Get-C "lblDiskTotal"; $barDisk      = Get-C "barDisk"
 $lblNetRx     = Get-C "lblNetRx";     $lblNetTx     = Get-C "lblNetTx"
 $graphCanvas  = Get-C "graphCanvas";  $graphCpu     = Get-C "graphCpu"; $graphRam = Get-C "graphRam"
-$procN = @(Get-C "p0n",Get-C "p1n",Get-C "p2n",Get-C "p3n",Get-C "p4n")
-$procM = @(Get-C "p0m",Get-C "p1m",Get-C "p2m",Get-C "p3m",Get-C "p4m")
-$procP = @(Get-C "p0p",Get-C "p1p",Get-C "p2p",Get-C "p3p",Get-C "p4p")
-$killB = @(Get-C "k0", Get-C "k1", Get-C "k2", Get-C "k3", Get-C "k4")
+# (cada Get-C entre parentesis: sin ellos PowerShell lo leia como UNA orden con todos los nombres de
+#  argumento y la lista de procesos y los botones Kill nunca se mostraban)
+$procN = @(0..4 | ForEach-Object { Get-C "p$($_)n" })
+$procM = @(0..4 | ForEach-Object { Get-C "p$($_)m" })
+$procP = @(0..4 | ForEach-Object { Get-C "p$($_)p" })
+$killB = @(0..4 | ForEach-Object { Get-C "k$_" })
 $txtLog=$null; $txtStatus=$null; $btnOptimize=$null; $btnFreeRam=$null
 $txtLog           = Get-C "txtLog";         $txtStatus      = Get-C "txtStatus"
 $btnOptimize      = Get-C "btnOptimize";    $btnFreeRam     = Get-C "btnFreeRam"
@@ -414,11 +440,11 @@ function SafeBar($ctrl,$val)  { try { if ($ctrl) { $ctrl.Value=[Math]::Max(0,[Ma
 
 # Categorias de recomendacion
 $script:knownSystem = @(
-    'SecurityHealth','SecurityHealthSystray','Windows Security','MicrosoftEdgeAutoLaunch',
+    'SecurityHealth','SecurityHealthSystray','Windows Security',
     'ctfmon','InputPersonalization','BingSvc','OneDriveSetup','WinDefend'
 )
 $script:knownNonEssential = @(
-    'OneDrive','Teams','MicrosoftTeams','Discord','Spotify','Steam','EpicGamesLauncher',
+    'MicrosoftEdgeAutoLaunch','OneDrive','Teams','MicrosoftTeams','Discord','Spotify','Steam','EpicGamesLauncher',
     'AdobeGCInvoker','AdobeUpdater','Skype','Zoom','Slack','iTunesHelper','QuickTime',
     'iCloudServices','Dropbox','GoogleDriveFS','Box','WhatsApp','Telegram',
     'CCleanerBrowser','Avast','AVG','McAfee','Norton','Cortana','XboxApp',
@@ -437,17 +463,24 @@ function Get-StartupRec($name) {
     return @{Text='Desconocido'; Color='#888888'}
 }
 
+# Donde guarda Windows el estado activo/inactivo de cada origen (igual que el Administrador de tareas)
+$script:StartupApproved = @{
+    'HKCU'    = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
+    'HKLM'    = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
+    'HKLM32'  = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32'
+    'Carpeta' = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder'
+    'CarpetaComun' = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder'
+}
+
 function Get-StartupEnabled($source, $name) {
     try {
-        $approvedPath = if ($source -eq 'HKCU') {
-            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
-        } else {
-            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
-        }
-        if (Test-Path $approvedPath) {
+        $approvedPath = $script:StartupApproved[$source]
+        if ($approvedPath -and (Test-Path $approvedPath)) {
             $val = Get-ItemPropertyValue -Path $approvedPath -Name $name -EA Stop
             if ($val -and $val.Length -ge 1) {
-                return ($val[0] -eq 2)
+                # Windows usa 02/06 = activo y 03/07 = inactivo (bit 1 encendido = inactivo).
+                # Antes solo 02 contaba como activo y el 06 salia como "inactivo" por error.
+                return (($val[0] -band 1) -eq 0)
             }
         }
     } catch {}
@@ -456,11 +489,8 @@ function Get-StartupEnabled($source, $name) {
 
 function Set-StartupEnabled($source, $name, $enabled) {
     try {
-        $approvedPath = if ($source -eq 'HKCU') {
-            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
-        } else {
-            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
-        }
+        $approvedPath = $script:StartupApproved[$source]
+        if (-not $approvedPath) { return $false }
         if (-not (Test-Path $approvedPath)) {
             New-Item -Path $approvedPath -Force -EA Stop | Out-Null
         }
@@ -474,11 +504,27 @@ function Set-StartupEnabled($source, $name, $enabled) {
     } catch { return $false }
 }
 
+function New-StartupItem($name, $cmd, $source) {
+    $enabled = Get-StartupEnabled $source $name
+    $rec     = Get-StartupRec $name
+    $short   = if ($cmd.Length -gt 50) { $cmd.Substring(0,47) + '...' } else { $cmd }
+    return @{
+        Name    = [string]$name
+        Command = $short
+        Source  = [string]$source
+        Enabled = [bool]$enabled
+        RecText = [string]$rec.Text
+        RecColor= [string]$rec.Color
+    }
+}
+
 function Get-AllStartupItems {
     $items = New-Object System.Collections.Generic.List[hashtable]
+    # Registro: usuario, equipo (64 bits) y programas de 32 bits
     $regPaths = @(
         @{ Path='HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'; Source='HKCU' }
         @{ Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'; Source='HKLM' }
+        @{ Path='HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'; Source='HKLM32' }
     )
     foreach ($rp in $regPaths) {
         try {
@@ -486,20 +532,19 @@ function Get-AllStartupItems {
             $props = Get-ItemProperty -Path $rp.Path -EA Stop
             $props.PSObject.Properties |
                 Where-Object { $_.Name -notlike 'PS*' } |
-                ForEach-Object {
-                    $enabled = Get-StartupEnabled $rp.Source $_.Name
-                    $rec     = Get-StartupRec $_.Name
-                    $cmd     = [string]$_.Value
-                    $short   = if ($cmd.Length -gt 50) { $cmd.Substring(0,47) + '...' } else { $cmd }
-                    $items.Add(@{
-                        Name    = [string]$_.Name
-                        Command = $short
-                        Source  = [string]$rp.Source
-                        Enabled = [bool]$enabled
-                        RecText = [string]$rec.Text
-                        RecColor= [string]$rec.Color
-                    })
-                }
+                ForEach-Object { $items.Add((New-StartupItem $_.Name ([string]$_.Value) $rp.Source)) }
+        } catch {}
+    }
+    # Carpetas "Inicio" (accesos directos): la del usuario y la comun a todos los usuarios
+    $folders = @(
+        @{ Path=[Environment]::GetFolderPath('Startup'); Source='Carpeta' }
+        @{ Path=[Environment]::GetFolderPath('CommonStartup'); Source='CarpetaComun' }
+    )
+    foreach ($f in $folders) {
+        try {
+            if (-not $f.Path -or -not (Test-Path $f.Path)) { continue }
+            Get-ChildItem -Path $f.Path -File -EA Stop | Where-Object { $_.Name -ne 'desktop.ini' } |
+                ForEach-Object { $items.Add((New-StartupItem $_.Name $_.FullName $f.Source)) }
         } catch {}
     }
     return $items.ToArray()
@@ -523,9 +568,9 @@ function Refresh-StartupUI {
 
             # Fila contenedora
             $border = New-Object System.Windows.Controls.Border
-            $border.BorderThickness = [System.Windows.Thickness](0,0,0,1)
+            $border.BorderThickness = [System.Windows.Thickness]::new(0,0,0,1)
             $border.BorderBrush = [System.Windows.Media.SolidColorBrush]([System.Windows.Media.Color]::FromRgb(0xEE,0xEE,0xEE))
-            $border.Padding = [System.Windows.Thickness](2,3,2,3)
+            $border.Padding = [System.Windows.Thickness]::new(2,3,2,3)
 
             $grid = New-Object System.Windows.Controls.Grid
             $c1 = New-Object System.Windows.Controls.ColumnDefinition; $c1.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
@@ -573,8 +618,8 @@ function Refresh-StartupUI {
             $btnToggle = New-Object System.Windows.Controls.Button
             $btnToggle.Content = if ($itemCopy['Enabled']) { "Desactivar" } else { "Activar" }
             $btnToggle.FontSize = 9
-            $btnToggle.Padding = [System.Windows.Thickness](3,2,3,2)
-            $btnToggle.Margin  = [System.Windows.Thickness](3,1,0,1)
+            $btnToggle.Padding = [System.Windows.Thickness]::new(3,2,3,2)
+            $btnToggle.Margin  = [System.Windows.Thickness]::new(3,1,0,1)
             $btnToggle.Cursor  = [System.Windows.Input.Cursors]::Hand
             $btnToggle.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
             if ($itemCopy['Enabled']) {
@@ -661,18 +706,18 @@ function Update-UI {
     try {
         $cm=$script:d['CacheMB']; $tm2=$script:d['TotalMB']
         SafeText $lblCacheMB (FmtMB $cm)
-        SafeBar $barCache (if($tm2 -gt 0){[int]($cm*100/$tm2)}else{0})
+        SafeBar $barCache $(if($tm2 -gt 0){[int]($cm*100/$tm2)}else{0})
     } catch {}
     try {
         $cpu=$script:d['CpuPct']; $ct=$script:d['CpuTempC']
         SafeText $lblCpuPct  "$cpu%"; SafeText $lblCpuName $script:d['CpuName']
-        SafeText $lblCpuTemp (if($ct -gt 0){"$ct C"}else{"No disponible"}); SafeBar $barCpu $cpu
+        SafeText $lblCpuTemp $(if($ct -gt 0){"$ct C"}else{"No disponible"}); SafeBar $barCpu $cpu
     } catch {}
     try {
         $df=$script:d['DiskFree']; $dt=$script:d['DiskTotal']; $du=$dt-$df
         SafeText $lblDiskFree  (Fmt $df); SafeText $lblDiskUsed  (Fmt $du)
         SafeText $lblDiskTotal (Fmt $dt)
-        SafeBar $barDisk (if($dt -gt 0){[int]($du*100/$dt)}else{0})
+        SafeBar $barDisk $(if($dt -gt 0){[int]($du*100/$dt)}else{0})
     } catch {}
     try { SafeText $lblNetRx (FmtNet $script:d['NetRxBps']); SafeText $lblNetTx (FmtNet $script:d['NetTxBps']) } catch {}
     try {
@@ -682,8 +727,8 @@ function Update-UI {
             $mb=if($ms -and $i -lt $ms.Length){[int]$ms[$i]}else{0}
             $pd=if($ps2 -and $i -lt $ps2.Length){[int]$ps2[$i]}else{0}
             SafeText $procN[$i] $nm
-            SafeText $procM[$i] (if($nm -ne ''){"$mb MB"}else{''})
-            SafeText $procP[$i] (if($nm -ne ''){"PID $pd"}else{''})
+            SafeText $procM[$i] $(if($nm -ne ''){"$mb MB"}else{''})
+            SafeText $procP[$i] $(if($nm -ne ''){"PID $pd"}else{''})
             if ($killB[$i]) {
                 $killB[$i].Tag=$pd
                 $killB[$i].Visibility=if($nm -ne ''){[System.Windows.Visibility]::Visible}else{[System.Windows.Visibility]::Collapsed}
@@ -708,18 +753,44 @@ function Update-UI {
 # ============================================================
 #  ACCIONES
 # ============================================================
+function Get-FreeRamMB {
+    try { return [long]((Get-CimInstance Win32_OperatingSystem -Property FreePhysicalMemory -EA Stop).FreePhysicalMemory / 1KB) } catch { return -1L }
+}
+# Recorta la memoria en uso (working set) de los 40 procesos que mas ocupan. Devuelve cuantos se recortaron.
+# Poner el minimo a 1 hace que Windows devuelva a la RAM libre las paginas que el proceso no esta usando.
+# (Antes se ponia tambien el MAXIMO a 1: Windows lo rechaza, y por eso el contador siempre decia 0 procesos.)
+function Invoke-TrimWorkingSets {
+    $sk=@('System','smss','csrss','wininit','winlogon','lsass','services','svchost','Registry','MsMpEng','dwm','fontdrvhost','Idle')
+    $n=0
+    Get-Process -EA SilentlyContinue | Where-Object { $_.WorkingSet64 -gt 10MB -and $sk -notcontains $_.ProcessName } |
+        Sort-Object WorkingSet64 -Descending | Select-Object -First 40 |
+        ForEach-Object { try { $_.MinWorkingSet=[IntPtr]1; $n++ } catch {} }
+    return $n
+}
+# Borra archivos temporales de MAS DE 24 HORAS en %TEMP% y Windows\Temp.
+# (Antes borraba tambien los recientes: podia romper un instalador que estaba en marcha.)
+function Invoke-CleanTemp {
+    $r = @{ Bytes = 0L; Files = 0; InUse = 0 }
+    $limit = (Get-Date).AddDays(-1)
+    foreach ($p in @($env:TEMP,"$env:SystemRoot\Temp")) {
+        if (-not (Test-Path $p)) { continue }
+        Get-ChildItem $p -Recurse -Force -File -EA SilentlyContinue | Where-Object { $_.LastWriteTime -lt $limit } |
+            ForEach-Object {
+                $len = $_.Length
+                try { Remove-Item -LiteralPath $_.FullName -Force -EA Stop; $r.Bytes += $len; $r.Files++ } catch { $r.InUse++ }
+            }
+    }
+    return $r
+}
 function Free-RAM {
     try {
         SafeStatus "Liberando RAM..."
-        $b=$script:d['FreeMB']
+        $b = Get-FreeRamMB
         [System.GC]::Collect(2,[System.GCCollectionMode]::Forced); [System.GC]::WaitForPendingFinalizers(); [System.GC]::Collect()
-        $sk=@('System','smss','csrss','wininit','winlogon','lsass','services','svchost','Registry','MsMpEng','dwm','fontdrvhost','Idle')
-        $n=0
-        Get-Process -EA SilentlyContinue | Where-Object { $_.WorkingSet64 -gt 10MB -and $sk -notcontains $_.ProcessName } |
-            Sort-Object WorkingSet64 -Descending | Select-Object -First 40 |
-            ForEach-Object { try{$_.MinWorkingSet=[IntPtr]1;$_.MaxWorkingSet=[IntPtr]1;$n++}catch{} }
+        $n = Invoke-TrimWorkingSets
         Start-Sleep -Milliseconds 600
-        $freed=($script:d['FreeMB']-$b)*1MB; if($freed -lt 0){$freed=0}
+        $a = Get-FreeRamMB
+        $freed = if ($b -ge 0 -and $a -ge 0) { [Math]::Max(0L, $a - $b) * 1MB } else { 0 }
         $msg=if($freed -gt 1MB){"RAM liberada: $(Fmt $freed) ($n procesos)"}else{"RAM optimizada ($n procesos)"}
         SafeLog $msg; SafeStatus "Listo - $msg"
     } catch { SafeStatus "Error al liberar RAM" }
@@ -727,14 +798,9 @@ function Free-RAM {
 function Clean-Temp {
     try {
         SafeStatus "Limpiando temporales..."
-        $total=0L; $files=0; $errs=0
-        foreach ($p in @($env:TEMP,"$env:SystemRoot\Temp")) {
-            if (-not (Test-Path $p)) { continue }
-            Get-ChildItem $p -Recurse -Force -EA SilentlyContinue | Where-Object {-not $_.PSIsContainer} |
-                ForEach-Object { try{$total+=$_.Length;Remove-Item $_.FullName -Force -EA Stop;$files++}catch{$errs++} }
-        }
-        $extra=if($errs -gt 0){", $errs en uso"}else{""}
-        $msg="Temporales: $(Fmt $total) ($files archivos$extra)"
+        $r = Invoke-CleanTemp
+        $extra=if($r.InUse -gt 0){", $($r.InUse) en uso"}else{""}
+        $msg="Temporales: $(Fmt $r.Bytes) ($($r.Files) archivos de mas de 24 h$extra)"
         SafeLog $msg; SafeStatus "Listo - $msg"
     } catch { SafeStatus "Error al limpiar" }
 }
@@ -742,19 +808,14 @@ function Quick-Optimize {
     try {
         SafeLog "=== Optimizacion rapida ==="; SafeStatus "Optimizando..."
         [System.GC]::Collect(2,[System.GCCollectionMode]::Forced); [System.GC]::WaitForPendingFinalizers()
-        $total=0L; $files=0
-        foreach ($p in @($env:TEMP,"$env:SystemRoot\Temp")) {
-            if (-not (Test-Path $p)) { continue }
-            Get-ChildItem $p -Recurse -Force -EA SilentlyContinue | Where-Object {-not $_.PSIsContainer} |
-                ForEach-Object {try{$total+=$_.Length;Remove-Item $_.FullName -Force -EA Stop;$files++}catch{}}
-        }
-        $sk=@('System','smss','csrss','wininit','winlogon','lsass','services','svchost','Registry','MsMpEng','dwm','fontdrvhost','Idle')
-        $n=0
-        Get-Process -EA SilentlyContinue | Where-Object { $_.WorkingSet64 -gt 10MB -and $sk -notcontains $_.ProcessName } |
-            Sort-Object WorkingSet64 -Descending | Select-Object -First 40 |
-            ForEach-Object {try{$_.MinWorkingSet=[IntPtr]1;$_.MaxWorkingSet=[IntPtr]1;$n++}catch{}}
-        SafeLog ("Temporales: "+(Fmt $total)+" ($files archivos)"); SafeLog "RAM: $n procesos ajustados"
-        SafeLog "=== Completado ==="; SafeStatus ("Listo - "+(Fmt $total)+" + $n procesos")
+        $b = Get-FreeRamMB
+        $r = Invoke-CleanTemp
+        $n = Invoke-TrimWorkingSets
+        Start-Sleep -Milliseconds 600
+        $a = Get-FreeRamMB
+        $freed = if ($b -ge 0 -and $a -ge 0) { [Math]::Max(0L, $a - $b) * 1MB } else { 0 }
+        SafeLog ("Temporales: "+(Fmt $r.Bytes)+" ($($r.Files) archivos)"); SafeLog ("RAM: $n procesos ajustados, "+(Fmt $freed)+" liberados")
+        SafeLog "=== Completado ==="; SafeStatus ("Listo - "+(Fmt $r.Bytes)+" de temporales + "+(Fmt $freed)+" de RAM")
     } catch { SafeStatus "Error en optimizacion" }
 }
 function Kill-Proc($pid2,$name) {
@@ -844,7 +905,7 @@ On $miAlwaysTop Unchecked { $window.Topmost=$false }
 On $miPowerPlan Click { try{Start-Process "powercfg.cpl"}catch{} }
 On $miGithub    Click { try{Start-Process "https://github.com/EnMaNueL-G/WinOptimizer"}catch{} }
 On $miAbout     Click {
-    $msg="WinOptimizer v2.3.1`r`n"
+    $msg="WinOptimizer v2.3.2`r`n"
     $msg+="Optimizador para Windows 10/11`r`n`r`n"
     $msg+="  RAM fisica, virtual, cache, CPU, Disco, Red`r`n"
     $msg+="  Top 5 procesos con Kill`r`n"
@@ -886,7 +947,7 @@ $window.Add_Loaded({
     try { Init-Tray } catch {}
     try { Start-Worker } catch { SafeLog "Worker error: $_" }
     try { $script:timer.Start() } catch {}
-    SafeLog "WinOptimizer v2.3.1 iniciado"
+    SafeLog "WinOptimizer v2.3.2 iniciado"
     SafeStatus "Cargando datos del sistema..."
     # $script:stTimer — scope de script para que el Tick closure lo encuentre
     $script:stTimer = [System.Windows.Threading.DispatcherTimer]::new()
